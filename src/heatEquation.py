@@ -4,7 +4,7 @@ import mpi4py.MPI as MPI
 import ufl
 from petsc4py import PETSc
 
-from meshGeneration import BoxMesh
+from meshGeneration import create_mesh
 from dolfinx.fem.petsc import assemble_vector, assemble_matrix, create_vector, set_bc, apply_lifting
 from boundarys import NeumannCoupledBoundary, DirichletCoupledBoundary, DirichletBoundary, LinearInterpolationBoundary
 from dolfinx import fem
@@ -37,8 +37,12 @@ class HeatEquation():
         self.writeInterval = self.solver_parameters['write_interval']
         self.num_steps = int(self.end_time/self.dt)
 
-        # Create boxMesh
-        self.mesh = BoxMesh(meshDimensions, meshLengths, self.LOCAL_COMM_WORLD)
+        # coupling parameters
+        spatial_sampler = self.solver_parameters['spatial_sampler']
+        spatial_sampler_params = self.solver_parameters['spatial_sampler_params']
+
+        # Box or file mesh
+        self.mesh = create_mesh(self.solver_parameters, meshDimensions, meshLengths, self.LOCAL_COMM_WORLD)
 
         # Define function spaces
         self.V = fem.functionspace(self.mesh.domain, ("Lagrange", poly_order))
@@ -80,17 +84,20 @@ class HeatEquation():
         match self.solver_parameters['coupled_boundary_type']:
             case "neumann":
                 self.left_boundary = NeumannCoupledBoundary("CoupledBoundary", self.mesh.domain, self.V, self.mesh.p_min[0], 0, 
-                                                    self.mesh.fdim, self.mesh.gdim, LEFT_MARK, self.LOCAL_COMM_WORLD, self.GLOBAL_COMM_WORLD, self.uh, self.q_flux)
+                                                    self.mesh.fdim, self.mesh.gdim, LEFT_MARK, self.LOCAL_COMM_WORLD, self.GLOBAL_COMM_WORLD, self.uh, self.q_flux,
+                                                    spatial_sampler, spatial_sampler_params)
 
             case "dirichlet":
                 print("Hello")
                 self.left_boundary = DirichletCoupledBoundary("CoupledBoundary", self.mesh.domain, self.V, self.mesh.p_min[0], 0, 
-                                                    self.mesh.fdim, self.mesh.gdim, LEFT_MARK, self.LOCAL_COMM_WORLD, self.GLOBAL_COMM_WORLD, self.uh, self.thermal_conductivity, poly_order)
+                                                    self.mesh.fdim, self.mesh.gdim, LEFT_MARK, self.LOCAL_COMM_WORLD, self.GLOBAL_COMM_WORLD, self.uh, self.thermal_conductivity, poly_order,
+                                                    spatial_sampler, spatial_sampler_params)
                 self.left_boundary.set_bc_val(self.case_parameters['left_bc_temp'])
                 self.bcs.append(self.left_boundary.bc)
             case "linearInterpolation":
                 self.left_boundary = LinearInterpolationBoundary("CoupledBoundary", self.mesh.domain, self.V, self.mesh.p_min[0], 0, 
-                                                    self.mesh.fdim, self.mesh.gdim, LEFT_MARK, self.LOCAL_COMM_WORLD, self.GLOBAL_COMM_WORLD, self.uh, self.mesh.dx, self.thermal_conductivity.value)
+                                                    self.mesh.fdim, self.mesh.gdim, LEFT_MARK, self.LOCAL_COMM_WORLD, self.GLOBAL_COMM_WORLD, self.uh, self.mesh.dx, self.thermal_conductivity.value,
+                                                    spatial_sampler, spatial_sampler_params)
                 self.left_boundary.set_bc_val(self.case_parameters['left_bc_temp'])
                 self.bcs.append(self.left_boundary.bc)
             case "none":

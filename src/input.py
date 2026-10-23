@@ -23,4 +23,15 @@ class Input:
         for key in solver_parameter_keys:
             if key not in self.solver_parameters:
                 raise Exception("Mandatory field, " + key + " not included in " + self.solver_parameters_path)
+
+        # Optional fields
+        solver_parameter_defaults = {
+            "mesh_type": "box",
+            "mesh_file": None,
+            "mesh_name": "mesh",
+            "spatial_sampler": None,
+            "spatial_sampler_params": {},
+        }
+        for key, default in solver_parameter_defaults.items():
+            self.solver_parameters.setdefault(key, default)
         

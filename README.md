@@ -96,9 +96,28 @@ The json files should have the following formats:
     "nz": 1,            # mesh resolution in z-direction
     "coupled_boundary_type": "neumann",      # coupled boundary type, possible options are: neumann, dirichlet, linearInterpolation, none
     "inner_loop_iterations": 8,              # iteration of inner loop for strong coupling
-    "write_interval": 1.0               # how often (in seconds) to write field data to xdmf file.
+    "write_interval": 1.0,              # how often (in seconds) to write field data to xdmf file.
+    "spatial_sampler": "pseudo_n2_linear",   # optional, MUI sampler used to fetch values across the interface
+    "spatial_sampler_params": {"h": 0.2}     # optional, arguments for that sampler
 }
 ```
+
+`spatial_sampler` defaults to `pseudo_n2_linear` (linear interpolation between the two nearest points), so it can be left out. The available samplers and their parameters are:
+
+| Sampler | Parameters (default) |
+|---|---|
+| `pseudo_n2_linear` | `h` search radius (0.2) |
+| `pseudo_nearest_neighbor` | `h` search radius (0.2) |
+| `exact` | `tol` (MUI default) |
+| `gauss` | `r`, `h` (required) |
+| `shepard_quintic` | `r` (0.2) |
+| `sph_quintic` | `r` (0.2) |
+| `sum_quintic` | `r` (0.2) |
+| `rbf` | `r` (0.3), `basis` (0, Gaussian), `pou_size` (50) |
+
+Note: `rbf` returns NaN when the incoming points all lie on one line, which is the case when the fluid interface is a single row of faces (as in the one-cell-thick example cases). Use `pseudo_n2_linear` on this side for those cases. `nearest_neighbor` and `moving_average` are not offered because their mui4py wrappers are broken.
+
+No sampler extrapolates, so values at the ends of the interface are the least accurate: the solid end points lie beyond the last fluid face centre. For a standalone example of `rbf`, see [07-pseudo-diffusion](https://github.com/MxUI/MUI-demo/tree/master/07-pseudo-diffusion) in MUI-demo.
 
 Then run the heat solver from the directory above "solid" as below. Note that if coupled_boundary_type is not set to 'none' then a corresponding openfoam script is required.
 

@@ -1,5 +1,6 @@
 from basix import index
 import numpy as np
+from mpi4py import MPI
 from scipy.spatial import cKDTree
 import mui4py
 from dolfinx import mesh, fem, geometry
@@ -7,6 +8,54 @@ from dolfinx.fem.petsc import LinearProblem
 import ufl
 
 DOMAIN = "HeatSolverFenics"
+
+
+# mui4py derives binding names from these
+class SamplerPseudoN2Linear(mui4py.SamplerPseudoNearest2Linear):
+    pass
+
+
+class SamplerShepardQuintic(mui4py.SamplerSherpardQuintic):
+    pass
+
+
+def rbf_sampler(p, points):
+    to_point = mui4py.mui4py_mod._Point3d_f64_i64
+    return mui4py.SamplerRbf(p.get("r", 0.3), [to_point(list(x)) for x in points],
+                             p.get("basis", 0), False, False, True, "", 1e-9, 1e-6, 0,
+                             p.get("pou_size", 50), 1, None)
+
+
+# moving_average, nearest_neighbor broken in mui4py
+SPATIAL_SAMPLERS = {
+    "exact": lambda p, pts: mui4py.SamplerExact(p.get("tol")),
+    "gauss": lambda p, pts: mui4py.SamplerGauss(p["r"], p["h"]),
+    "pseudo_nearest_neighbor": lambda p, pts: mui4py.SamplerPseudoNearestNeighbor(p.get("h", 0.2)),
+    "pseudo_n2_linear": lambda p, pts: SamplerPseudoN2Linear(p.get("h", 0.2)),
+    "shepard_quintic": lambda p, pts: SamplerShepardQuintic(p.get("r", 0.2)),
+    "sph_quintic": lambda p, pts: mui4py.SamplerSphQuintic(p.get("r", 0.2)),
+    "sum_quintic": lambda p, pts: mui4py.SamplerSumQuintic(p.get("r", 0.2)),
+    "rbf": rbf_sampler,
+}
+
+DEFAULT_SPATIAL_SAMPLER = "pseudo_n2_linear"
+
+
+def create_spatial_sampler(name=None, params=None, points=None):
+    name = name or DEFAULT_SPATIAL_SAMPLER
+    params = params or {}
+
+    if name not in SPATIAL_SAMPLERS:
+        raise Exception("Invalid spatial sampler, " + name + ", specified. Choose one of: "
+                        + ", ".join(sorted(SPATIAL_SAMPLERS)))
+    if name == "rbf" and points is None:
+        raise Exception("Spatial sampler, rbf, needs the fetch points")
+
+    try:
+        return SPATIAL_SAMPLERS[name](params, points)
+    except KeyError as missing_param:
+        raise Exception("Spatial sampler, " + name + ", requires " + str(missing_param)
+                        + " in spatial_sampler_params")
 
 class Boundary():
 
@@ -17,6 +66,11 @@ class Boundary():
         self.MARK = MARK
 
         self.facets = mesh.locate_entities_boundary(domain, fdim, self.on_boundary)
+
+        if domain.comm.allreduce(self.facets.shape[0], op=MPI.SUM) == 0:
+            raise Exception("Boundary, " + name + ", matched no facets at axis " + str(axis)
+                            + " = " + str(position) + ". Check the mesh extent")
+
         self.facet_tag = mesh.meshtags(domain, fdim, self.facets, np.full_like(self.facets, MARK))
 
         self.ds = ufl.Measure("ds", domain=domain, subdomain_data=self.facet_tag)
@@ -57,15 +111,12 @@ class Boundary():
         self.u_bc.interpolate(self)
     
     def __call__(self, x, tol=1e-12):
+        distances, neighbours = self.tree.query(x.T)
+
         values = np.zeros(x.shape[1])
+        on_boundary = distances < tol
+        values[on_boundary] = self.values[neighbours[on_boundary]]
 
-        dofs = x.T
-        for index in range(len(dofs)):
-            distance_to_neighbour, neighbour_index = self.tree.query(dofs[index])
-
-            if distance_to_neighbour < tol:
-                values[index] = self.values[neighbour_index]
-        
         return values
 
 class DirichletBoundary(Boundary):
@@ -80,7 +131,8 @@ class DirichletBoundary(Boundary):
 
 class CoupledBoundary(Boundary):
 
-    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func):
+    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func,
+                 spatial_sampler=None, spatial_sampler_params=None):
         super().__init__(name, domain, V, position, axis, fdim, gdim, MARK)
         self.MPI_COMM_WORLD = MPI_COMM_WORLD
         self.PYTHON_COMM_WORLD = PYTHON_COMM_WORLD
@@ -113,9 +165,16 @@ class CoupledBoundary(Boundary):
         
         # coordinates must be rounded to account for differing precisions betweeen openfoam and python
         self.coupling_coordinates = np.round(self.dof_coords, decimals=8)
-        
+
+        # Push owned dofs only, avoids duplicates
+        index_map = V.dofmap.index_map
+        self.owned = self.dofs < index_map.size_local * V.dofmap.index_map_bs
+        self.push_coordinates = self.coupling_coordinates[self.owned]
+
         # define samplers
-        self.s_sampler = mui4py.SamplerPseudoNearestNeighbor(0.2)
+        self.spatial_sampler_name = spatial_sampler or DEFAULT_SPATIAL_SAMPLER
+        self.s_sampler = create_spatial_sampler(spatial_sampler, spatial_sampler_params,
+                                                self.coupling_coordinates)
         self.t_sampler_exact = mui4py.TemporalSamplerExact()
         self.t_sampler = mui4py.TemporalSamplerLinear()
 
@@ -128,9 +187,11 @@ class CoupledBoundary(Boundary):
 
 class NeumannCoupledBoundary(CoupledBoundary):
 
-    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func, q_flux):
+    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func, q_flux,
+                 spatial_sampler=None, spatial_sampler_params=None):
          # define neumann boundary condition, v=TestFunction(V)
-        super().__init__(name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func)
+        super().__init__(name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func,
+                         spatial_sampler, spatial_sampler_params)
         self.q_flux = q_flux
         self.flux_values = np.zeros(self.dof_coords.shape[0])
 
@@ -140,7 +201,7 @@ class NeumannCoupledBoundary(CoupledBoundary):
         T = self.u_func.x.array[self.dofs]
    
         #push temperature to neighbour
-        self.interface.push_many("temp", self.coupling_coordinates, T)
+        self.interface.push_many("temp", self.push_coordinates, T[self.owned])
         self.interface.commit( iteration )
 
         # fetch heat flux from neighbour
@@ -152,8 +213,10 @@ class NeumannCoupledBoundary(CoupledBoundary):
    
 class DirichletCoupledBoundary(CoupledBoundary):
 
-    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func, kappa, poly_order):
-        super().__init__(name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func)
+    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func, kappa, poly_order,
+                 spatial_sampler=None, spatial_sampler_params=None):
+        super().__init__(name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func,
+                         spatial_sampler, spatial_sampler_params)
 
         # Create vector function space for flux
         self.V_g = fem.functionspace(domain, ("Lagrange", poly_order, (gdim, )))
@@ -170,7 +233,7 @@ class DirichletCoupledBoundary(CoupledBoundary):
     def update(self, iteration):
         Q = self.compute_heat_flux()
         # push heat_flux to neighbour
-        self.interface.push_many("flux", self.coupling_coordinates, Q)
+        self.interface.push_many("flux", self.push_coordinates, Q[self.owned])
         self.interface.commit( iteration )
 
         # fetch temperature from neighbour
@@ -189,8 +252,10 @@ class DirichletCoupledBoundary(CoupledBoundary):
 # Deprecated for now
 class LinearInterpolationBoundary(CoupledBoundary):
 
-    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func, dx, kappa):
-        super().__init__(name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func)
+    def __init__(self, name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func, dx, kappa,
+                 spatial_sampler=None, spatial_sampler_params=None):
+        super().__init__(name, domain, V, position, axis, fdim, gdim, MARK, PYTHON_COMM_WORLD, MPI_COMM_WORLD, u_func,
+                         spatial_sampler, spatial_sampler_params)
 
         self.kDelta = kappa/dx
 
@@ -207,7 +272,7 @@ class LinearInterpolationBoundary(CoupledBoundary):
 
         self.interface.push("weight", self.coupling_coordinates[0], self.kDelta)
 
-        self.interface.push_many("temp", self.coupling_coordinates, T1)
+        self.interface.push_many("temp", self.push_coordinates, T1[self.owned])
         self.interface.commit(iteration)
 
         nbrKDelta = self.interface.fetch("weight", self.coupling_coordinates[0], iteration, self.s_sampler, self.t_sampler)
